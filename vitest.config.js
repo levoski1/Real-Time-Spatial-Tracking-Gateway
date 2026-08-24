@@ -6,7 +6,19 @@ export default defineConfig({
     environment: "node",
     include: ["tests/**/*.test.js"],
     coverage: {
+      provider: "v8",
       reporter: ["text", "lcov"],
+      exclude: [
+        "src/storage/postgres.js",
+        "vitest.config.js",
+        "eslint.config.js",
+      ],
+      thresholds: {
+        branches: 80,
+        functions: 85,
+        lines: 85,
+        statements: 85,
+      },
     },
   },
 });

@@ -94,13 +94,25 @@ Copy the environment template and adjust values:
 cp .env.example .env
 ```
 
-| Variable              | Default              | Description                           |
-|-----------------------|----------------------|---------------------------------------|
-| `PORT`                | `8080`               | WebSocket server listen port          |
-| `WS_HEARTBEAT_MS`     | `30000`              | Interval for connection pings         |
-| `MAX_PAYLOAD_BYTES`   | `1024`               | Maximum incoming message size         |
-| `DATABASE_URL`        | —                    | Connection string for storage adapter |
-| `AUTH_SECRET`         | —                    | Secret for token verification         |
+| Variable                   | Default   | Description                                            |
+|----------------------------|-----------|--------------------------------------------------------|
+| `PORT`                     | `8080`    | WebSocket server listen port                           |
+| `WS_HEARTBEAT_MS`          | `30000`   | Interval for connection pings (ms)                     |
+| `MAX_PAYLOAD_BYTES`        | `1024`    | Maximum incoming message size (bytes)                  |
+| `MAX_ROOM_SIZE`            | `500`     | Maximum number of clients in a room                    |
+| `DATABASE_URL`             | —         | Connection string for storage adapter                  |
+| `AUTH_SECRET`              | —         | Secret for token verification                          |
+| `MAX_TIMESTAMP_SKEW_MS`    | `30000`   | Maximum allowed clock skew on location timestamps (ms) |
+| `LOG_LEVEL`                | `info`    | Minimum log severity (`debug` \| `info` \| `warn` \| `error`) |
+| `MAX_MESSAGES_PER_SECOND`  | `100`     | Per-client message rate limit (messages per second)    |
+| `CONN_RATE_LIMIT`          | `30`      | Max new connections per IP address per minute          |
+| `SESSION_ENCRYPTION_KEY`   | —         | 32-byte base64 key (or `{"v1":"…"}` key map) that enables session resumption |
+| `SESSION_TTL_MS`           | `3600000` | Sliding TTL of a stored session (ms)                   |
+| `INSTANCE_ID`              | uuid      | Identity published in the `GW_AFFINITY` cookie          |
+
+#### Tuning rate limits for high-traffic deployments
+
+For high-traffic scenarios such as dense fleet tracking or large-scale live events, tune the two rate-limit variables to match your expected load. Raise `MAX_MESSAGES_PER_SECOND` (e.g. `500`) if individual clients publish location updates at sub-second intervals. Raise `CONN_RATE_LIMIT` (e.g. `120`) when a large number of devices reconnect simultaneously — common after a server restart or network partition. Lower these values in consumer-facing deployments to reduce the blast radius of misbehaving or malicious clients. Both variables take effect at startup; restart the server after changing them.
 
 ### Running
 
@@ -125,6 +137,30 @@ wss://<host>:<port>/?token=<jwt>
 ```
 
 Clients must provide a valid JWT as a query parameter. Connections without a valid token are rejected with a `4001` close code.
+
+### Session Resumption
+
+Set `SESSION_ENCRYPTION_KEY` to enable it; without the key the gateway behaves exactly as before.
+
+The gateway seals each client's session state (rooms, sequence numbers, rate-limit window) with AES-256-GCM. The blob is the `session_id`. On reconnect the client presents it as a URL-encoded query parameter, or as the JWT `sid` claim:
+
+```
+wss://<host>:<port>/?token=<jwt>&session_id=<url-encoded blob>
+```
+
+The gateway restores the rooms and replies with `session_resumed`, carrying each room's saved `highestAckedSeq` / `highestReceivedSeq` plus the room's live `currentSeqPerRoom`. The client then sends the usual `reconnect` message for any room that shows a gap. A blob that fails to decrypt, has expired, or belongs to another identity is ignored and the connection continues as a new session.
+
+Clients that cannot store a blob get the `GW_AFFINITY=<instanceId>` cookie on the handshake response: when they land back on the same instance, the session is restored from that instance's local cache.
+
+A fresh blob also arrives with `server_shutting_down` on graceful shutdown, and with close code `4100` (in the close reason, or a preceding `migrate` frame) after `POST /admin/v1/clients/{clientId}/migrate`. `GET /metrics` reports the `session_resumption_total` counters.
+
+### HTTP Health Check
+
+```
+GET /health
+```
+
+Returns `200 OK` with JSON `{"status":"OK"}` when the gateway is active. This endpoint is unauthenticated and intended for container health checks and orchestrator liveness probes.
 
 ### Message Format
 
@@ -154,12 +190,22 @@ All messages are JSON-encoded. Every message **must** contain a `type` field:
 
 ### Server-to-Client Messages
 
-| Type               | Description                               |
-|--------------------|-------------------------------------------|
-| `location_update`  | Broadcast from another room member        |
-| `room_joined`      | Confirmation of room join                 |
-| `room_left`        | Confirmation of room leave                |
-| `error`            | Validation error or server error          |
+| Type               | Description                                                                 |
+|--------------------|-----------------------------------------------------------------------------|
+| `location_update`  | Broadcast from another room member                                          |
+| `room_joined`      | Confirmation of room join                                                    |
+| `room_left`        | Confirmation of room leave                                                   |
+| `error`            | Validation error or server error. Payload includes `message` and `code`.    |
+
+#### Error codes
+
+The `error` frame payload includes a machine-readable `code` field that clients should use to handle failures programmatically.
+
+- `INVALID_JSON` — malformed JSON input.
+- `VALIDATION_ERROR` — message schema or payload validation failed.
+- `RATE_LIMITED` — request rejected due to connection or rate limits.
+- `ROOM_FULL` — room join request rejected because the room is full.
+- `AUTH_FAILED` — authentication failed.
 
 ---
 
